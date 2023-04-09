@@ -25,12 +25,11 @@ func NewTestServer(t *testing.T) *Server {
 
 	addr := fmt.Sprintf("%s:%d", "127.0.0.1", ports[0])
 
-	b, err := NewBroker(addr)
+	s, err := NewServer(addr)
 	if err != nil {
-		t.Fatalf("err != nil: %s", err)
+		t.Fatal(err)
 	}
-
-	return NewServer(addr, b)
+	return s
 }
 
 func TestProduceConsume(t *testing.T) {

@@ -31,15 +31,20 @@ type Server struct {
 	responseCh   chan *Context
 }
 
-func NewServer(addr string, handler Handler) *Server {
+func NewServer(addr string) (*Server, error) {
+	b, err := NewBroker(addr)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		addr:       addr,
-		handler:    handler,
+		handler:    b,
 		shutdownCh: make(chan struct{}),
 		requestCh:  make(chan *Context, 1024),
 		responseCh: make(chan *Context, 1024),
 	}
-	return s
+	return s, nil
 }
 
 // Start starts the service.
