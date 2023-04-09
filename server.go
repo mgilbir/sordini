@@ -6,7 +6,6 @@ import (
 	"net"
 	"sync"
 
-	"github.com/mgilbir/sordini/config"
 	"github.com/mgilbir/sordini/protocol"
 	log "github.com/sirupsen/logrus"
 )
@@ -22,7 +21,7 @@ type Handler interface {
 // Server is used to handle the TCP connections, decode requests,
 // defer to the broker, and encode the responses.
 type Server struct {
-	config       *config.Config
+	addr         string
 	protocolLn   *net.TCPListener
 	handler      Handler
 	shutdown     bool
@@ -32,9 +31,9 @@ type Server struct {
 	responseCh   chan *Context
 }
 
-func NewServer(config *config.Config, handler Handler, close func() error) *Server {
+func NewServer(addr string, handler Handler) *Server {
 	s := &Server{
-		config:     config,
+		addr:       addr,
 		handler:    handler,
 		shutdownCh: make(chan struct{}),
 		requestCh:  make(chan *Context, 1024),
@@ -45,7 +44,7 @@ func NewServer(config *config.Config, handler Handler, close func() error) *Serv
 
 // Start starts the service.
 func (s *Server) Start(ctx context.Context) error {
-	protocolAddr, err := net.ResolveTCPAddr("tcp", s.config.Addr)
+	protocolAddr, err := net.ResolveTCPAddr("tcp", s.addr)
 	if err != nil {
 		return err
 	}
@@ -64,7 +63,7 @@ func (s *Server) Start(ctx context.Context) error {
 			default:
 				conn, err := s.protocolLn.Accept()
 				if err != nil {
-					log.Errorf("server/%d: listener accept error: %s", s.config.ID, err)
+					log.Errorf("server: listener accept error: %s", err)
 					continue
 				}
 
@@ -83,13 +82,13 @@ func (s *Server) Start(ctx context.Context) error {
 			case respCtx := <-s.responseCh:
 
 				if err := s.handleResponse(respCtx); err != nil {
-					log.Errorf("server/%d: handle response error: %s", s.config.ID, err)
+					log.Errorf("server: handle response error: %s", err)
 				}
 			}
 		}
 	}()
 
-	log.Debugf("server/%d: run handler", s.config.ID)
+	log.Debug("server: run handler")
 	go s.handler.Run(ctx, s.requestCh, s.responseCh)
 
 	return nil
@@ -206,7 +205,7 @@ func (s *Server) handleRequest(conn net.Conn) {
 		}
 
 		if err := req.Decode(d, header.APIVersion); err != nil {
-			log.Errorf("server/%d: %s: decode request failed: %s", s.config.ID, header, err)
+			log.Errorf("server: %s: decode request failed: %s", header, err)
 			panic(err)
 		}
 
@@ -216,14 +215,14 @@ func (s *Server) handleRequest(conn net.Conn) {
 			conn:   conn,
 		}
 
-		log.Debugf("server/%d: handle request: %s", s.config.ID, reqCtx)
+		log.Debugf("server: handle request: %s", reqCtx)
 
 		s.requestCh <- reqCtx
 	}
 }
 
 func (s *Server) handleResponse(respCtx *Context) error {
-	log.Debugf("server/%d: handle response: %s", s.config.ID, respCtx)
+	log.Debugf("server: handle response: %s", respCtx)
 
 	b, err := protocol.Encode(respCtx.res.(protocol.Encoder))
 	if err != nil {
@@ -236,8 +235,4 @@ func (s *Server) handleResponse(respCtx *Context) error {
 // Addr returns the address on which the Server is listening
 func (s *Server) Addr() net.Addr {
 	return s.protocolLn.Addr()
-}
-
-func (s *Server) ID() int32 {
-	return s.config.ID
 }

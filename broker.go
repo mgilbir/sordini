@@ -5,11 +5,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/mgilbir/sordini/config"
 	"github.com/mgilbir/sordini/protocol"
 	"github.com/pkg/errors"
 )
@@ -23,13 +21,13 @@ var (
 
 // Broker represents a broker in a Jocko cluster, like a broker in a Kafka cluster.
 type Broker struct {
-	mu     sync.RWMutex
-	config *config.Config
+	mu   sync.RWMutex
+	addr string
+	id   int32
 
-	logStateInterval time.Duration
-	offsetMu         sync.RWMutex
-	offset           int64
-	topics           map[string]interface{}
+	offsetMu sync.RWMutex
+	offset   int64
+	topics   map[string]interface{}
 
 	shutdownCh   chan struct{}
 	shutdown     bool
@@ -39,23 +37,23 @@ type Broker struct {
 }
 
 // New is used to instantiate a new broker.
-func NewBroker(cfg *config.Config) (*Broker, error) {
+func NewBroker(addr string) (*Broker, error) {
 	b := &Broker{
-		config:           cfg,
-		shutdownCh:       make(chan struct{}),
-		logStateInterval: time.Millisecond * 250,
-		topics:           make(map[string]interface{}),
+		id:         1,
+		addr:       addr,
+		shutdownCh: make(chan struct{}),
+		topics:     make(map[string]interface{}),
 	}
 	return b, nil
 }
 
 func (b *Broker) host() string {
-	addrTokens := strings.Split(b.config.Addr, ":")
+	addrTokens := strings.Split(b.addr, ":")
 	return addrTokens[0]
 }
 
 func (b *Broker) port() int32 {
-	addrTokens := strings.Split(b.config.Addr, ":")
+	addrTokens := strings.Split(b.addr, ":")
 	port, err := strconv.ParseInt(addrTokens[1], 10, 32)
 	if err != nil {
 		log.Fatalf("failed to parse port: %v", err)
@@ -76,7 +74,7 @@ func (b *Broker) Run(ctx context.Context, requests <-chan *Context, responses ch
 	for {
 		select {
 		case reqCtx := <-requests:
-			log.Debugf("broker/%d: request: %v", b.config.ID, reqCtx)
+			log.Debugf("broker/%d: request: %v", b.id, reqCtx)
 
 			if reqCtx == nil {
 				goto DONE
@@ -141,7 +139,7 @@ func (b *Broker) Run(ctx context.Context, requests <-chan *Context, responses ch
 		}
 	}
 DONE:
-	log.Debugf("broker/%d: run done", b.config.ID)
+	log.Debugf("broker/%d: run done", b.id)
 }
 
 // req handling.
@@ -189,9 +187,9 @@ func (b *Broker) handleProduce(ctx *Context, req *protocol.ProduceRequest) *prot
 	res := new(protocol.ProduceResponse)
 	res.APIVersion = req.Version()
 	res.Responses = make([]*protocol.ProduceTopicResponse, len(req.TopicData))
-	log.Debugf("broker/%d: produce: %#v", b.config.ID, req)
+	log.Debugf("broker/%d: produce: %#v", b.id, req)
 	for i, td := range req.TopicData {
-		log.Debugf("broker/%d: produce to partition: %d: %v", b.config.ID, i, td)
+		log.Debugf("broker/%d: produce to partition: %d: %v", b.id, i, td)
 		tres := make([]*protocol.ProducePartitionResponse, len(td.Data))
 		for j, p := range td.Data {
 			pres := &protocol.ProducePartitionResponse{}
@@ -199,7 +197,7 @@ func (b *Broker) handleProduce(ctx *Context, req *protocol.ProduceRequest) *prot
 
 			msgSet, err := ProcessRecordSet(p.RecordSet)
 			if err != nil {
-				log.Errorf("broker/%d: process record set: %s", b.config.ID, err)
+				log.Errorf("broker/%d: process record set: %s", b.id, err)
 				pres.ErrorCode = protocol.ErrUnknown.Code()
 				continue
 			}
@@ -245,33 +243,27 @@ func (b *Broker) handleMetadata(ctx *Context, req *protocol.MetadataRequest) *pr
 				&protocol.PartitionMetadata{
 					PartitionErrorCode: protocol.ErrNone.Code(),
 					PartitionID:        0,
-					Leader:             b.config.ID,
-					Replicas:           []int32{b.config.ID},
-					ISR:                []int32{b.config.ID},
+					Leader:             b.id,
+					Replicas:           []int32{b.id},
+					ISR:                []int32{b.id},
 				},
 			},
 		},
 		)
 	}
 
-	log.Debugf("broker/%d: metadata: %#v", b.config.ID, req)
-
-	addrTokens := strings.Split(b.config.Addr, ":")
-	port, err := strconv.ParseInt(addrTokens[1], 10, 32)
-	if err != nil {
-		panic(err)
-	}
+	log.Debugf("broker/%d: metadata: %#v", b.id, req)
 
 	brokers := []*protocol.Broker{
 		&protocol.Broker{
-			NodeID: b.config.ID,
-			Host:   addrTokens[0],
-			Port:   int32(port),
+			NodeID: b.id,
+			Host:   b.host(),
+			Port:   b.port(),
 		},
 	}
 
 	res := &protocol.MetadataResponse{
-		ControllerID:  b.config.ID,
+		ControllerID:  b.id,
 		Brokers:       brokers,
 		TopicMetadata: topicMetadata,
 	}
@@ -295,7 +287,7 @@ func (b *Broker) handleFindCoordinator(ctx *Context, req *protocol.FindCoordinat
 	res := &protocol.FindCoordinatorResponse{}
 	res.APIVersion = req.Version()
 
-	res.Coordinator.NodeID = b.config.ID
+	res.Coordinator.NodeID = b.id
 	res.Coordinator.Host = b.host()
 	res.Coordinator.Port = b.port()
 
@@ -381,13 +373,13 @@ func (b *Broker) handleOffsetFetch(ctx *Context, req *protocol.OffsetFetchReques
 
 // Leave is used to prepare for a graceful shutdown.
 func (b *Broker) Leave() error {
-	log.Infof("broker/%d: starting leave", b.config.ID)
+	log.Infof("broker/%d: starting leave", b.id)
 
 	return nil
 }
 
 func (b *Broker) Shutdown() error {
-	log.Infof("broker/%d: shutting down broker", b.config.ID)
+	log.Infof("broker/%d: shutting down broker", b.id)
 	b.shutdownLock.Lock()
 	defer b.shutdownLock.Unlock()
 

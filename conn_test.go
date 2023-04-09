@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mgilbir/sordini/config"
 	"github.com/mgilbir/sordini/protocol"
 )
 
@@ -15,11 +14,7 @@ const (
 )
 
 func TestConn(t *testing.T) {
-	s := NewTestServer(t, func(cfg *config.Config) {
-		cfg.Bootstrap = true
-		cfg.BootstrapExpect = 1
-		cfg.StartAsLeader = true
-	}, nil)
+	s := NewTestServer(t)
 	err := s.Start(context.Background())
 	if err != nil {
 		t.Fatal(err)

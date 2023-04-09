@@ -6,21 +6,35 @@ import (
 
 	"sync"
 
+	"fmt"
+
 	"github.com/Shopify/sarama"
 	"github.com/hashicorp/serf/testutil/retry"
-	"github.com/mgilbir/sordini/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	dynaport "github.com/travisjeffery/go-dynaport"
 )
 
 const (
 	topic = "test_topic"
 )
 
+func NewTestServer(t *testing.T) *Server {
+	ports := dynaport.Get(4)
+
+	addr := fmt.Sprintf("%s:%d", "127.0.0.1", ports[0])
+
+	b, err := NewBroker(addr)
+	if err != nil {
+		t.Fatalf("err != nil: %s", err)
+	}
+
+	return NewServer(addr, b)
+}
+
 func TestProduceConsume(t *testing.T) {
-	s1 := NewTestServer(t, func(cfg *config.Config) {
-		cfg.Bootstrap = true
-	}, nil)
+	s1 := NewTestServer(t)
 	ctx1, cancel1 := context.WithCancel((context.Background()))
 	defer cancel1()
 	err := s1.Start(ctx1)
