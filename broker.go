@@ -6,10 +6,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/mgilbir/sordini/protocol"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/mgilbir/sordini/protocol"
 	"github.com/pkg/errors"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 var (
@@ -19,6 +20,11 @@ var (
 	OffsetsTopicNumPartitions = 50
 )
 
+type topicPartition struct {
+	topic     string
+	partition int32
+}
+
 // Broker represents a broker in a Jocko cluster, like a broker in a Kafka cluster.
 type Broker struct {
 	mu   sync.RWMutex
@@ -26,7 +32,7 @@ type Broker struct {
 	id   int32
 
 	offsetMu sync.RWMutex
-	offset   int64
+	offset   map[topicPartition]int64
 	topics   map[string]interface{}
 
 	shutdownCh   chan struct{}
@@ -41,6 +47,7 @@ func NewBroker(addr string) (*Broker, error) {
 	b := &Broker{
 		id:         1,
 		addr:       addr,
+		offset:     make(map[topicPartition]int64),
 		shutdownCh: make(chan struct{}),
 		topics:     make(map[string]interface{}),
 	}
@@ -80,46 +87,46 @@ func (b *Broker) Run(ctx context.Context, requests <-chan *Context, responses ch
 				goto DONE
 			}
 
-			var res protocol.ResponseBody
+			var res kmsg.Response
 
 			switch req := reqCtx.req.(type) {
-			case *protocol.ProduceRequest:
+			case *kmsg.ProduceRequest:
 				res = b.handleProduce(reqCtx, req)
-			case *protocol.OffsetsRequest:
-				res = b.handleOffsets(reqCtx, req)
-			case *protocol.MetadataRequest:
+			// case *kmsg.OffsetsRequest:
+			// 	res = b.handleOffsets(reqCtx, req)
+			case *kmsg.MetadataRequest:
 				res = b.handleMetadata(reqCtx, req)
-			case *protocol.LeaderAndISRRequest:
+			case *kmsg.LeaderAndISRRequest:
 				res = b.handleLeaderAndISR(reqCtx, req)
-			case *protocol.StopReplicaRequest:
+			case *kmsg.StopReplicaRequest:
 				res = b.handleStopReplica(reqCtx, req)
-			case *protocol.UpdateMetadataRequest:
+			case *kmsg.UpdateMetadataRequest:
 				res = b.handleUpdateMetadata(reqCtx, req)
-			case *protocol.ControlledShutdownRequest:
+			case *kmsg.ControlledShutdownRequest:
 				res = b.handleControlledShutdown(reqCtx, req)
-			case *protocol.OffsetCommitRequest:
+			case *kmsg.OffsetCommitRequest:
 				res = b.handleOffsetCommit(reqCtx, req)
-			case *protocol.OffsetFetchRequest:
+			case *kmsg.OffsetFetchRequest:
 				res = b.handleOffsetFetch(reqCtx, req)
-			case *protocol.FindCoordinatorRequest:
+			case *kmsg.FindCoordinatorRequest:
 				res = b.handleFindCoordinator(reqCtx, req)
-			case *protocol.JoinGroupRequest:
+			case *kmsg.JoinGroupRequest:
 				res = b.handleJoinGroup(reqCtx, req)
-			case *protocol.HeartbeatRequest:
+			case *kmsg.HeartbeatRequest:
 				res = b.handleHeartbeat(reqCtx, req)
-			case *protocol.LeaveGroupRequest:
+			case *kmsg.LeaveGroupRequest:
 				res = b.handleLeaveGroup(reqCtx, req)
-			case *protocol.SyncGroupRequest:
+			case *kmsg.SyncGroupRequest:
 				res = b.handleSyncGroup(reqCtx, req)
-			case *protocol.DescribeGroupsRequest:
+			case *kmsg.DescribeGroupsRequest:
 				res = b.handleDescribeGroups(reqCtx, req)
-			case *protocol.ListGroupsRequest:
+			case *kmsg.ListGroupsRequest:
 				res = b.handleListGroups(reqCtx, req)
-			case *protocol.SaslHandshakeRequest:
-				res = b.handleSaslHandshake(reqCtx, req)
-			case *protocol.APIVersionsRequest:
+			case *kmsg.SASLHandshakeRequest:
+				// res = b.handleSaslHandshake(reqCtx, req)
+			case *kmsg.ApiVersionsRequest:
 				res = b.handleAPIVersions(reqCtx, req)
-			case *protocol.CreateTopicRequests:
+			case *kmsg.CreateTopicsRequest:
 				res = b.handleCreateTopic(reqCtx, req)
 			default:
 				log.Errorf("broker: unknown request type: %T", req)
@@ -127,12 +134,9 @@ func (b *Broker) Run(ctx context.Context, requests <-chan *Context, responses ch
 			}
 
 			responses <- &Context{
-				conn:   reqCtx.conn,
-				header: reqCtx.header,
-				res: &protocol.Response{
-					CorrelationID: reqCtx.header.CorrelationID,
-					Body:          res,
-				},
+				conn:          reqCtx.conn,
+				correlationID: reqCtx.correlationID,
+				res:           res,
 			}
 		case <-ctx.Done():
 			goto DONE
@@ -144,108 +148,104 @@ DONE:
 
 // req handling.
 
-var apiVersions = &protocol.APIVersionsResponse{APIVersions: protocol.APIVersions}
+// var apiVersions = &kmsg.APIVersionsResponse{APIVersions: kmsg.APIVersions}
+var apiVersions = &kmsg.ApiVersionsResponse{Version: 5} //FIX
 
-func (b *Broker) handleAPIVersions(ctx *Context, req *protocol.APIVersionsRequest) *protocol.APIVersionsResponse {
+func (b *Broker) handleAPIVersions(ctx *Context, req *kmsg.ApiVersionsRequest) *kmsg.ApiVersionsResponse {
 	return apiVersions
 }
 
-func (b *Broker) handleCreateTopic(ctx *Context, reqs *protocol.CreateTopicRequests) *protocol.CreateTopicsResponse {
-	res := new(protocol.CreateTopicsResponse)
-	res.APIVersion = reqs.Version()
+func (b *Broker) handleCreateTopic(ctx *Context, reqs *kmsg.CreateTopicsRequest) *kmsg.CreateTopicsResponse {
+	res := kmsg.NewCreateTopicsResponse()
+	res.Version = reqs.Version
 
-	return res
+	return &res
 }
 
-func (b *Broker) handleOffsets(ctx *Context, req *protocol.OffsetsRequest) *protocol.OffsetsResponse {
-	res := new(protocol.OffsetsResponse)
-	res.APIVersion = req.Version()
-	res.Responses = make([]*protocol.OffsetResponse, len(req.Topics))
-	for i, t := range req.Topics {
-		res.Responses[i] = new(protocol.OffsetResponse)
-		res.Responses[i].Topic = t.Topic
-		res.Responses[i].PartitionResponses = make([]*protocol.PartitionResponse, 0, len(t.Partitions))
-		for _, p := range t.Partitions {
-			pres := new(protocol.PartitionResponse)
-			pres.Partition = p.Partition
-			offset := b.NewestOffset()
-			pres.Offsets = []int64{offset}
-			res.Responses[i].PartitionResponses = append(res.Responses[i].PartitionResponses, pres)
-		}
-	}
-	return res
-}
+// func (b *Broker) handleOffsets(ctx *Context, req *kmsg.OffsetsRequest) *kmsg.OffsetsResponse {
+// 	res := kmsg.NewOffsetsResponse()
+// 	.APIVersion = req.Version
+// 	res.Responses = make([]*kmsg.OffsetResponse, len(req.Topics))
+// 	for i, t := range req.Topics {
+// 		res.Responses[i] = new(kmsg.OffsetResponse)
+// 		res.Responses[i].Topic = t.Topic
+// 		res.Responses[i].PartitionResponses = make([]*kmsg.PartitionResponse, 0, len(t.Partitions))
+// 		for _, p := range t.Partitions {
+// 			pres := kmsg.NewPartitionResponse()
+// 			pres.Partition = p.Partition
+// 			offset := b.NewestOffset()
+// 			pres.Offsets = []int64{offset}
+// 			res.Responses[i].PartitionResponses = append(res.Responses[i].PartitionResponses, pres)
+// 		}
+// 	}
+// 	return &res
+// }
 
-func (b *Broker) NewestOffset() int64 {
+func (b *Broker) NewestOffset(topic string, partition int32) int64 {
 	b.offsetMu.Lock()
 	defer b.offsetMu.Unlock()
-	b.offset++
-	return b.offset
+	tp := topicPartition{topic: topic, partition: partition}
+	v := b.offset[tp] + 1
+	b.offset[tp] = v
+	return v
 }
 
-func (b *Broker) handleProduce(ctx *Context, req *protocol.ProduceRequest) *protocol.ProduceResponse {
-	res := new(protocol.ProduceResponse)
-	res.APIVersion = req.Version()
-	res.Responses = make([]*protocol.ProduceTopicResponse, len(req.TopicData))
-	log.Debugf("broker/%d: produce: %#v", b.id, req)
-	for i, td := range req.TopicData {
-		log.Debugf("broker/%d: produce to partition: %d: %v", b.id, i, td)
-		tres := make([]*protocol.ProducePartitionResponse, len(td.Data))
-		for j, p := range td.Data {
-			pres := &protocol.ProducePartitionResponse{}
-			pres.Partition = p.Partition
+func (b *Broker) CurrentOffset(topic string, partition int32) int64 {
+	b.offsetMu.RLock()
+	defer b.offsetMu.RUnlock()
+	tp := topicPartition{topic: topic, partition: partition}
+	return b.offset[tp]
+}
 
-			msgSet, err := ProcessRecordSet(p.RecordSet)
+func (b *Broker) handleProduce(ctx *Context, req *kmsg.ProduceRequest) *kmsg.ProduceResponse {
+	res := kmsg.NewPtrProduceResponse()
+	res.Version = req.Version
+
+	for _, td := range req.Topics {
+		tres := kmsg.NewProduceResponseTopic()
+		tres.Topic = td.Topic
+		tres.Partitions = make([]kmsg.ProduceResponseTopicPartition, len(td.Partitions))
+		for i, p := range td.Partitions {
+			pres := kmsg.NewProduceResponseTopicPartition()
+			pres.Partition = p.Partition
+			pres.BaseOffset = b.CurrentOffset(td.Topic, p.Partition)
+			tres.Partitions[i] = pres
+
+			msgs, err := protocol.ExtractMessagePayload(p.Records)
 			if err != nil {
-				log.Errorf("broker/%d: process record set: %s", b.id, err)
-				pres.ErrorCode = protocol.ErrUnknown.Code()
-				continue
+				panic(err)
 			}
-			for _, cb := range b.callbacks {
-				for _, msg := range msgSet.Messages {
-					cb(td.Topic, b.NewestOffset(), p.Partition, msg.Key, msg.Value)
+
+			for _, msg := range msgs {
+				msg.Offset = b.NewestOffset(td.Topic, p.Partition)
+				for _, cb := range b.callbacks {
+					cb(td.Topic, msg.Offset, p.Partition, msg.Key, msg.Value)
 				}
 			}
-
-			tres[j] = pres
 		}
-		res.Responses[i] = &protocol.ProduceTopicResponse{
-			Topic:              td.Topic,
-			PartitionResponses: tres,
-		}
+		res.Topics = append(res.Topics, tres)
 	}
 	return res
 }
 
-func ProcessRecordSet(data []byte) (*protocol.MessageSet, error) {
-	log.Debug("process record set")
-	d := protocol.NewDecoder(data)
-	msgSet := new(protocol.MessageSet)
-	err := msgSet.Decode(d)
-	if err != nil {
-		return nil, err
-	}
-	return msgSet, nil
-}
-
-func (b *Broker) handleMetadata(ctx *Context, req *protocol.MetadataRequest) *protocol.MetadataResponse {
-	var topicMetadata []*protocol.TopicMetadata
+func (b *Broker) handleMetadata(ctx *Context, req *kmsg.MetadataRequest) *kmsg.MetadataResponse {
+	var topicMetadata []kmsg.MetadataResponseTopic
 
 	for _, topic := range req.Topics {
-		b.topics[topic] = nil
+		b.topics[*topic.Topic] = nil
 	}
 
 	for topic := range b.topics {
-		topicMetadata = append(topicMetadata, &protocol.TopicMetadata{
-			TopicErrorCode: protocol.ErrNone.Code(),
-			Topic:          topic,
-			PartitionMetadata: []*protocol.PartitionMetadata{
-				&protocol.PartitionMetadata{
-					PartitionErrorCode: protocol.ErrNone.Code(),
-					PartitionID:        0,
-					Leader:             b.id,
-					Replicas:           []int32{b.id},
-					ISR:                []int32{b.id},
+		resTopic := kmsg.NewMetadataResponseTopic()
+		resTopic.Topic = &topic
+		topicMetadata = append(topicMetadata, kmsg.MetadataResponseTopic{
+			Topic: &topic,
+			Partitions: []kmsg.MetadataResponseTopicPartition{
+				kmsg.MetadataResponseTopicPartition{
+					Partition: 0,
+					Leader:    b.id,
+					Replicas:  []int32{b.id},
+					ISR:       []int32{b.id},
 				},
 			},
 		},
@@ -254,120 +254,115 @@ func (b *Broker) handleMetadata(ctx *Context, req *protocol.MetadataRequest) *pr
 
 	log.Debugf("broker/%d: metadata: %#v", b.id, req)
 
-	brokers := []*protocol.Broker{
-		&protocol.Broker{
+	brokers := []kmsg.MetadataResponseBroker{
+		kmsg.MetadataResponseBroker{
 			NodeID: b.id,
 			Host:   b.host(),
 			Port:   b.port(),
 		},
 	}
 
-	res := &protocol.MetadataResponse{
-		ControllerID:  b.id,
-		Brokers:       brokers,
-		TopicMetadata: topicMetadata,
+	res := &kmsg.MetadataResponse{
+		ControllerID: b.id,
+		Brokers:      brokers,
+		Topics:       topicMetadata,
 	}
-	res.APIVersion = req.Version()
+	res.Version = req.Version
 	return res
 }
 
-func (b *Broker) handleLeaderAndISR(ctx *Context, req *protocol.LeaderAndISRRequest) *protocol.LeaderAndISRResponse {
-	res := &protocol.LeaderAndISRResponse{
-		Partitions: make([]*protocol.LeaderAndISRPartition, len(req.PartitionStates)),
+func (b *Broker) handleLeaderAndISR(ctx *Context, req *kmsg.LeaderAndISRRequest) *kmsg.LeaderAndISRResponse {
+	res := &kmsg.LeaderAndISRResponse{
+		Partitions: make([]kmsg.LeaderAndISRResponseTopicPartition, len(req.PartitionStates)),
 	}
-	res.APIVersion = req.Version()
+	res.Version = req.Version
 	for i, p := range req.PartitionStates {
-		res.Partitions[i] = &protocol.LeaderAndISRPartition{
-			Partition: p.Partition, Topic: p.Topic, ErrorCode: protocol.ErrNone.Code()}
+		res.Partitions[i] = kmsg.LeaderAndISRResponseTopicPartition{
+			Partition: p.Partition, Topic: p.Topic}
 	}
 	return res
 }
 
-func (b *Broker) handleFindCoordinator(ctx *Context, req *protocol.FindCoordinatorRequest) *protocol.FindCoordinatorResponse {
-	res := &protocol.FindCoordinatorResponse{}
-	res.APIVersion = req.Version()
+func (b *Broker) handleFindCoordinator(ctx *Context, req *kmsg.FindCoordinatorRequest) *kmsg.FindCoordinatorResponse {
+	res := &kmsg.FindCoordinatorResponse{}
+	res.Version = req.Version
 
-	res.Coordinator.NodeID = b.id
-	res.Coordinator.Host = b.host()
-	res.Coordinator.Port = b.port()
+	res.Coordinators = make([]kmsg.FindCoordinatorResponseCoordinator, 1)
+	res.Coordinators[0].NodeID = b.id
+	res.Coordinators[0].Host = b.host()
+	res.Coordinators[0].Port = b.port()
 
 	return res
 }
 
-func (b *Broker) handleJoinGroup(ctx *Context, r *protocol.JoinGroupRequest) *protocol.JoinGroupResponse {
+func (b *Broker) handleJoinGroup(ctx *Context, r *kmsg.JoinGroupRequest) *kmsg.JoinGroupResponse {
 
-	res := &protocol.JoinGroupResponse{}
-	res.APIVersion = r.Version()
+	res := &kmsg.JoinGroupResponse{}
+	res.Version = r.Version
 
-	res.GenerationID = 0
+	res.Generation = 0
 	res.MemberID = r.MemberID
 
 	return res
 }
 
-func (b *Broker) handleLeaveGroup(ctx *Context, r *protocol.LeaveGroupRequest) *protocol.LeaveGroupResponse {
-	res := &protocol.LeaveGroupResponse{}
-	res.APIVersion = r.Version()
+func (b *Broker) handleLeaveGroup(ctx *Context, r *kmsg.LeaveGroupRequest) *kmsg.LeaveGroupResponse {
+	res := &kmsg.LeaveGroupResponse{}
+	res.Version = r.Version
 
 	return res
 }
 
-func (b *Broker) handleSyncGroup(ctx *Context, r *protocol.SyncGroupRequest) *protocol.SyncGroupResponse {
-	res := &protocol.SyncGroupResponse{}
-	res.APIVersion = r.Version()
+func (b *Broker) handleSyncGroup(ctx *Context, r *kmsg.SyncGroupRequest) *kmsg.SyncGroupResponse {
+	res := &kmsg.SyncGroupResponse{}
+	res.Version = r.Version
 
 	return res
 }
 
-func (b *Broker) handleHeartbeat(ctx *Context, r *protocol.HeartbeatRequest) *protocol.HeartbeatResponse {
-	res := &protocol.HeartbeatResponse{}
-	res.APIVersion = r.Version()
-	res.ErrorCode = protocol.ErrNone.Code()
+func (b *Broker) handleHeartbeat(ctx *Context, r *kmsg.HeartbeatRequest) *kmsg.HeartbeatResponse {
+	res := &kmsg.HeartbeatResponse{}
+	res.Version = r.Version
 
 	return res
 }
 
-func (b *Broker) handleSaslHandshake(ctx *Context, req *protocol.SaslHandshakeRequest) *protocol.SaslHandshakeResponse {
-	panic("not implemented: sasl handshake")
+func (b *Broker) handleListGroups(ctx *Context, req *kmsg.ListGroupsRequest) *kmsg.ListGroupsResponse {
+	res := kmsg.NewListGroupsResponse()
+	res.Version = req.Version
+
+	return &res
 }
 
-func (b *Broker) handleListGroups(ctx *Context, req *protocol.ListGroupsRequest) *protocol.ListGroupsResponse {
-	res := new(protocol.ListGroupsResponse)
-	res.APIVersion = req.Version()
+func (b *Broker) handleDescribeGroups(ctx *Context, req *kmsg.DescribeGroupsRequest) *kmsg.DescribeGroupsResponse {
 
-	return res
+	res := kmsg.NewDescribeGroupsResponse()
+	res.Version = req.Version
+
+	return &res
 }
 
-func (b *Broker) handleDescribeGroups(ctx *Context, req *protocol.DescribeGroupsRequest) *protocol.DescribeGroupsResponse {
-
-	res := new(protocol.DescribeGroupsResponse)
-	res.APIVersion = req.Version()
-
-	return res
-}
-
-func (b *Broker) handleStopReplica(ctx *Context, req *protocol.StopReplicaRequest) *protocol.StopReplicaResponse {
+func (b *Broker) handleStopReplica(ctx *Context, req *kmsg.StopReplicaRequest) *kmsg.StopReplicaResponse {
 	panic("not implemented: stop replica")
 }
 
-func (b *Broker) handleUpdateMetadata(ctx *Context, req *protocol.UpdateMetadataRequest) *protocol.UpdateMetadataResponse {
+func (b *Broker) handleUpdateMetadata(ctx *Context, req *kmsg.UpdateMetadataRequest) *kmsg.UpdateMetadataResponse {
 	panic("not implemented: update metadata")
 }
 
-func (b *Broker) handleControlledShutdown(ctx *Context, req *protocol.ControlledShutdownRequest) *protocol.ControlledShutdownResponse {
+func (b *Broker) handleControlledShutdown(ctx *Context, req *kmsg.ControlledShutdownRequest) *kmsg.ControlledShutdownResponse {
 	panic("not implemented: controlled shutdown")
 }
 
-func (b *Broker) handleOffsetCommit(ctx *Context, req *protocol.OffsetCommitRequest) *protocol.OffsetCommitResponse {
+func (b *Broker) handleOffsetCommit(ctx *Context, req *kmsg.OffsetCommitRequest) *kmsg.OffsetCommitResponse {
 	panic("not implemented: offset commit")
 }
 
-func (b *Broker) handleOffsetFetch(ctx *Context, req *protocol.OffsetFetchRequest) *protocol.OffsetFetchResponse {
-	res := new(protocol.OffsetFetchResponse)
-	res.APIVersion = req.Version()
-	res.Responses = make([]protocol.OffsetFetchTopicResponse, len(req.Topics))
+func (b *Broker) handleOffsetFetch(ctx *Context, req *kmsg.OffsetFetchRequest) *kmsg.OffsetFetchResponse {
+	res := kmsg.NewOffsetFetchResponse()
+	res.Version = req.Version
 
-	return res
+	return &res
 
 }
 

@@ -2,12 +2,14 @@ package sordini
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 
-	"github.com/mgilbir/sordini/protocol"
 	log "github.com/sirupsen/logrus"
+	"github.com/twmb/franz-go/pkg/kbin"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // Broker is the interface that wraps the Broker's methods.
@@ -142,97 +144,57 @@ func (s *Server) handleRequest(conn net.Conn) {
 			break
 		}
 
-		size := protocol.Encoding.Uint32(p)
+		size := binary.BigEndian.Uint32(p)
 		if size == 0 {
 			break // TODO: should this even happen?
 		}
 
-		b := make([]byte, size+4) //+4 since we're going to copy the size into b
-		copy(b, p)
+		b := make([]byte, size) //+4 since we're going to copy the size into b
+		// copy(b, p)
 
-		if _, err = io.ReadFull(conn, b[4:]); err != nil {
+		if _, err = io.ReadFull(conn, b); err != nil {
 			// TODO: handle request
 			panic(err)
 		}
 
-		d := protocol.NewDecoder(b)
-		header := new(protocol.RequestHeader)
-		if err := header.Decode(d); err != nil {
-			// TODO: handle err
-			panic(err)
+		d := &kbin.Reader{
+			Src: b,
 		}
 
-		var req protocol.VersionedDecoder
+		key := kmsg.Key(d.Int16())
+		version := d.Int16()
+		correlationId := d.Int32()
+		clientId := d.NullableString()
 
-		switch header.APIKey {
-		case protocol.ProduceKey:
-			req = &protocol.ProduceRequest{}
-		case protocol.FetchKey:
-			req = &protocol.FetchRequest{}
-		case protocol.OffsetsKey:
-			req = &protocol.OffsetsRequest{}
-		case protocol.MetadataKey:
-			req = &protocol.MetadataRequest{}
-		case protocol.LeaderAndISRKey:
-			req = &protocol.LeaderAndISRRequest{}
-		case protocol.StopReplicaKey:
-			req = &protocol.StopReplicaRequest{}
-		case protocol.UpdateMetadataKey:
-			req = &protocol.UpdateMetadataRequest{}
-		case protocol.ControlledShutdownKey:
-			req = &protocol.ControlledShutdownRequest{}
-		case protocol.OffsetCommitKey:
-			req = &protocol.OffsetCommitRequest{}
-		case protocol.OffsetFetchKey:
-			req = &protocol.OffsetFetchRequest{}
-		case protocol.FindCoordinatorKey:
-			req = &protocol.FindCoordinatorRequest{}
-		case protocol.JoinGroupKey:
-			req = &protocol.JoinGroupRequest{}
-		case protocol.HeartbeatKey:
-			req = &protocol.HeartbeatRequest{}
-		case protocol.LeaveGroupKey:
-			req = &protocol.LeaveGroupRequest{}
-		case protocol.SyncGroupKey:
-			req = &protocol.SyncGroupRequest{}
-		case protocol.DescribeGroupsKey:
-			req = &protocol.DescribeGroupsRequest{}
-		case protocol.ListGroupsKey:
-			req = &protocol.ListGroupsRequest{}
-		case protocol.SaslHandshakeKey:
-			req = &protocol.SaslHandshakeRequest{}
-		case protocol.APIVersionsKey:
-			req = &protocol.APIVersionsRequest{}
-		case protocol.CreateTopicsKey:
-			req = &protocol.CreateTopicRequests{}
-		case protocol.DeleteTopicsKey:
-			req = &protocol.DeleteTopicsRequest{}
-		}
+		req := key.Request()
+		req.SetVersion(version)
 
-		if err := req.Decode(d, header.APIVersion); err != nil {
-			log.Errorf("server: %s: decode request failed: %s", header, err)
+		if err := req.ReadFrom(d.Src); err != nil {
+			log.Errorf("server: %s: decode request failed: %s", key.Name(), err)
 			panic(err)
 		}
 
 		reqCtx := &Context{
-			header: header,
-			req:    req,
-			conn:   conn,
+			correlationID: correlationId,
+			clientID:      clientId,
+			req:           req,
+			conn:          conn,
 		}
 
-		log.Debugf("server: handle request: %s", reqCtx)
+		log.Debugf("server: handle request: %v", reqCtx)
 
 		s.requestCh <- reqCtx
 	}
 }
 
 func (s *Server) handleResponse(respCtx *Context) error {
-	log.Debugf("server: handle response: %s", respCtx)
+	log.Debugf("server: handle response: %v", respCtx)
 
-	b, err := protocol.Encode(respCtx.res.(protocol.Encoder))
+	b, err := respCtx.ResponseToBytes()
 	if err != nil {
 		return err
 	}
+
 	_, err = respCtx.conn.Write(b)
 	return err
 }
