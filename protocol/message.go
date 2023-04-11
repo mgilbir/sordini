@@ -1,57 +1,85 @@
 package protocol
 
-import "time"
+import (
+	"encoding/binary"
+	"fmt"
 
-type Message struct {
-	Crc        int32
-	MagicByte  int8
-	Attributes int8
-	Timestamp  time.Time
-	Key        []byte
-	Value      []byte
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+type MessagePayload struct {
+	Offset int64
+	Key    []byte
+	Value  []byte
 }
 
-func (m *Message) Encode(e PacketEncoder) error {
-	e.Push(&CRCField{})
-	e.PutInt8(m.MagicByte)
-	e.PutInt8(m.Attributes)
-	if m.MagicByte > 0 {
-		e.PutInt64(m.Timestamp.UnixNano() / int64(time.Millisecond))
-	}
-	if err := e.PutBytes(m.Key); err != nil {
-		return err
-	}
-	if err := e.PutBytes(m.Value); err != nil {
-		return err
-	}
-	e.Pop()
-	return nil
-}
+func ExtractMessagePayload(in []byte) ([]MessagePayload, error) {
+	var ret []MessagePayload
 
-func (m *Message) Decode(d PacketDecoder) error {
-	if err := d.Push(&CRCField{}); err != nil {
-		return err
-	}
-
-	var err error
-	if m.MagicByte, err = d.Int8(); err != nil {
-		return err
-	}
-	if m.Attributes, err = d.Int8(); err != nil {
-		return err
-	}
-	if m.MagicByte > 0 {
-		t, err := d.Int64()
-		if err != nil {
-			return err
+	switch magic := in[16]; magic {
+	case 0:
+		m := new(kmsg.MessageV0)
+		if err := m.ReadFrom(in); err != nil {
+			return nil, err
 		}
-		m.Timestamp = time.Unix(t/1000, (t%1000)*int64(time.Millisecond))
+
+		ret = append(ret, MessagePayload{
+			Offset: m.Offset,
+			Key:    m.Key,
+			Value:  m.Value,
+		})
+
+	case 1:
+		m := new(kmsg.MessageV1)
+		if err := m.ReadFrom(in); err != nil {
+			return nil, err
+		}
+
+		ret = append(ret, MessagePayload{
+			Offset: m.Offset,
+			Key:    m.Key,
+			Value:  m.Value,
+		})
+
+	case 2:
+		rb := new(kmsg.RecordBatch)
+		if err := rb.ReadFrom(in); err != nil {
+			return nil, err
+		}
+
+		records, err := parseRecordBatch(rb.Records)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, r := range records {
+			ret = append(ret, MessagePayload{
+				Offset: int64(rb.FirstOffset) + int64(r.OffsetDelta),
+				Key:    r.Key,
+				Value:  r.Value,
+			})
+		}
+
+	default:
+		return nil, fmt.Errorf("unknown magic %d", magic)
 	}
-	if m.Key, err = d.Bytes(); err != nil {
-		return err
+
+	return ret, nil
+}
+
+func parseRecordBatch(in []byte) ([]kmsg.Record, error) {
+	var ret []kmsg.Record
+
+	for len(in) > 4 {
+		l := int32(binary.BigEndian.Uint32(in[:4]))
+		r := new(kmsg.Record)
+		if err := r.ReadFrom(in[:l]); err != nil {
+			return nil, err
+		}
+
+		ret = append(ret, *r)
+		in = in[l:]
 	}
-	if m.Value, err = d.Bytes(); err != nil {
-		return err
-	}
-	return d.Pop()
+
+	return ret, nil
 }
